@@ -3,6 +3,8 @@
 
 # ignore credentials
 credentials.json
+token.json
+*.json
 
 # don't upload pycache
 __pycache__/
