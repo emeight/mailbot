@@ -1,6 +1,9 @@
 # ignore environment variables
 .env
 
+# ignore credentials
+credentials.json
+
 # don't upload pycache
 __pycache__/
 *.pyc
