@@ -1,2 +1,1 @@
 # mailbot
-Inbox helper.
