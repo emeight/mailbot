@@ -2,8 +2,6 @@
 .env
 
 # ignore credentials
-credentials.json
-token.json
 *.json
 
 # don't upload pycache
