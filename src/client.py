@@ -1,4 +1,5 @@
-from typing import Dict, List, Optional, Set
+import logging
+from typing import Dict, List, Optional, Set, Tuple
 
 from google.oauth2.credentials import Credentials
 from googleapiclient.discovery import Resource, build
@@ -11,7 +12,9 @@ from src.impl.message import (
     send_new_message,
 )
 from src.schemas.message import GmailMessage
-from src.utils import validate_email_addresses, validate_message_recipients
+from src.utils import validate_email_addresses
+
+logger = logging.getLogger(__name__)
 
 
 class GmailServiceClient:
@@ -44,33 +47,57 @@ class GmailServiceClient:
         service = build("gmail", "v1", credentials=creds)
         return cls(service, valid_addresses)
 
+    def validate_address_set(self, candidates: Set[str]) -> None:
+        """Validate a set of address against the instatiated `valid_addresses` attribute."""
+        return validate_email_addresses(candidates, self.valid_addresses)
+
+    def scope_to_valid_recipients(
+        self, to: List[str], cc: List[str]
+    ) -> Tuple[Set[str], Set[str]]:
+        """Create a tuple of valid (to, cc) addresses."""
+        # create valid subsets
+        valid_to_set = set(to) & self.valid_addresses
+        valid_cc_set = set(cc) & self.valid_addresses
+
+        if len(valid_to_set) < 1:
+            raise ValueError("No valid recipients were specified.")
+
+        return valid_to_set, valid_cc_set
+
     def fetch_message(
         self, id: str, download_attachments: bool = False
     ) -> Optional[GmailMessage]:
         """Fetch a specific message from the inbox."""
         try:
             msg = fetch_message_by_id(self.service, id, download_attachments)
+            logger.info(f'Successfully retrieved message with ID: "{id}"')
         except KeyError:
             msg = None
         return msg
 
-    def fetch_unread_messages(self, download_attachments: bool = False) -> List[GmailMessage]:
+    def fetch_unread_messages(
+        self, download_attachments: bool = False
+    ) -> List[GmailMessage]:
         """Fetch unread messages from the inbox."""
         msg_id_dict = fetch_unread_message_ids(self.service)
         unread_msg_ids = list(msg_id_dict.keys())
 
         out = []
+        ignored = []
         for msg_id in unread_msg_ids:
             try:
                 # attempt to fetch the message
                 sender_addr = fetch_sender_email(self.service, msg_id)
-                validate_email_addresses({sender_addr}, self.valid_addresses)
+                self.validate_address_set({sender_addr})
             except ValueError:
                 # invalid sender, do not fetch
+                ignored.append(sender_addr)
                 continue
 
             # if the sender was valid, fetch and append the message
             out.append(self.fetch_message(msg_id, download_attachments))
+
+        logger.info(f"Ignored {len(ignored)} messages from the following senders: {set(ignored)}")
 
         return out
 
@@ -90,7 +117,7 @@ class GmailServiceClient:
         recipients = set(to)
         if cc:
             recipients.update(cc)
-        validate_email_addresses(recipients, self.valid_addresses)
+        self.validate_address_set(recipients)
 
         return send_new_message(
             self.service,
@@ -117,19 +144,10 @@ class GmailServiceClient:
         if original.from_ not in self.valid_addresses:
             raise ValueError("Original sender is invalid.")
 
-        if not set(original.to) <= self.valid_addresses:
-            raise ValueError("Primary recipients are invalid.")
-
-        try:
-            # validate recipients
-            validate_message_recipients(original, self.valid_addresses)
-        except ValueError:
-            if reply_all:
-                # create a subset of valid response addresses
-                original.cc = list(set(original.cc) & self.valid_addresses)
-            else:
-                # re-raise the error
-                raise
+        # this will raise an error if impossible to scope a response
+        valid_to, valid_cc = self.scope_to_valid_recipients(original.to, original.cc)
+        original.to = list(valid_to)
+        original.cc = list(valid_cc)
 
         return reply_to_existing_message(
             self.service,
