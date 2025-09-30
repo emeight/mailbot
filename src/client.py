@@ -5,6 +5,7 @@ from googleapiclient.discovery import Resource, build
 
 from src.impl.message import (
     fetch_message_by_id,
+    fetch_sender_email,
     fetch_unread_message_ids,
     reply_to_existing_message,
     send_new_message,
@@ -43,11 +44,6 @@ class GmailServiceClient:
         service = build("gmail", "v1", credentials=creds)
         return cls(service, valid_addresses)
 
-    def fetch_unread_messages(self) -> List[str]:
-        """Fetch unread messages from the inbox."""
-        msg_id_dict = fetch_unread_message_ids(self.service)
-        return list(msg_id_dict.keys())
-
     def fetch_message(
         self, id: str, download_attachments: bool = False
     ) -> Optional[GmailMessage]:
@@ -58,9 +54,29 @@ class GmailServiceClient:
             msg = None
         return msg
 
+    def fetch_unread_messages(self, download_attachments: bool = False) -> List[GmailMessage]:
+        """Fetch unread messages from the inbox."""
+        msg_id_dict = fetch_unread_message_ids(self.service)
+        unread_msg_ids = list(msg_id_dict.keys())
+
+        out = []
+        for msg_id in unread_msg_ids:
+            try:
+                # attempt to fetch the message
+                sender_addr = fetch_sender_email(self.service, msg_id)
+                validate_email_addresses({sender_addr}, self.valid_addresses)
+            except ValueError:
+                # invalid sender, do not fetch
+                continue
+
+            # if the sender was valid, fetch and append the message
+            out.append(self.fetch_message(msg_id, download_attachments))
+
+        return out
+
     def send_message(
         self,
-        recipient: str,
+        to: List[str],
         subject: str,
         body_text: str,
         *,
@@ -71,14 +87,14 @@ class GmailServiceClient:
     ) -> Dict[str, str]:
         """Send an email to the specified recipient."""
         # recipient validation
-        recipients = {recipient}
+        recipients = set(to)
         if cc:
             recipients.update(cc)
         validate_email_addresses(recipients, self.valid_addresses)
 
         return send_new_message(
             self.service,
-            recipient=recipient,
+            to=to,
             subject=subject,
             body_text=body_text,
             cc=cc,
@@ -97,11 +113,12 @@ class GmailServiceClient:
         attachment_paths: Optional[List[str]] = None,
     ) -> Dict[str, str]:
         """Reply to an existing email message."""
-        if original.to not in self.valid_addresses:
-            raise ValueError("Primary recipient is invalid.")
 
         if original.from_ not in self.valid_addresses:
             raise ValueError("Original sender is invalid.")
+
+        if not set(original.to) <= self.valid_addresses:
+            raise ValueError("Primary recipients are invalid.")
 
         try:
             # validate recipients

@@ -1,4 +1,5 @@
 import os
+import time
 from typing import List
 
 from dotenv import load_dotenv
@@ -20,33 +21,21 @@ valid_addresses = load_email_set(os.getenv("VALID_ADDRESS_PATH"))
 creds = retrieve_credentials(scopes)
 service_client = GmailServiceClient.from_credentials(creds, valid_addresses)
 
+# configuration
+sleep_interval = 60  # seconds
+max_loops = 5
 
-try:
-    resp_dict = service_client.send_message(
-        dev_recipient, "Hello World!", "It's sunny outside."
-    )
-    print("Successfully sent test message.")
-except (ValueError, RuntimeError, Exception):
-    print("Failed valid recipient test.")
+for loop_count in range(max_loops):
+    unread_messages = service_client.fetch_unread_messages()
+    print(f"Fetched {len(unread_messages)} new messages.")
 
-try:
-    sent_msg = service_client.fetch_message(resp_dict["id"])
-    print("Successfully fetched test message.")
-except (RuntimeError, Exception):
-    print("Failed fetching test.")
+    for msg_obj in unread_messages:
+        service_client.reply_to_message(
+            msg_obj, 
+            "Your message has been received.", 
+            reply_all=True
+        )
 
-try:
-    invalid_resp_dict = service_client.send_message(
-        dev_invalid, "Something went wrong...", "This is awkward."
-    )
-    raise PermissionError
-except PermissionError:
-    print("Permission error resulted in an email to an invalid address.")
-except (RuntimeError, KeyError, Exception):
-    print("Successfully failed to send a message to an invalid address.")
-
-try:
-    service_client.reply_to_message(sent_msg, "Reply test.", reply_all=True)
-    print("Passed reply test.")
-except (ValueError, RuntimeError, Exception):
-    print("Failed reply test.")
+    # Sleep after processing, but not after the last loop
+    if loop_count < max_loops - 1:
+        time.sleep(sleep_interval)

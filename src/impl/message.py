@@ -1,7 +1,7 @@
 import base64
 import mimetypes
 from email.message import EmailMessage
-from email.utils import getaddresses
+from email.utils import getaddresses, parseaddr
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
@@ -98,6 +98,54 @@ def extract_message_content(
         extract_message_content(child, found, attachments)
 
 
+def fetch_sender_email(service: Resource, id: str) -> str:
+    """Fetch only the sender email address for a message.
+    
+    Parameters
+    ----------
+    service : Resource
+        googleapiclient resource object.
+    id : str
+        Unique message identifier.
+        
+    Returns
+    -------
+    str
+        Sender email address.
+
+    """
+    
+    try:
+        # Only fetch metadata with the From header
+        msg = (
+            service.users()
+            .messages()
+            .get(
+                userId="me",
+                id=id,
+                format="metadata",
+                metadataHeaders=["From"]
+            )
+            .execute()
+        )
+        
+        # extract From header
+        headers = msg.get("payload", {}).get("headers", [])
+        from_header = next(
+            (h["value"] for h in headers if h["name"].lower() == "from"),
+            ""
+        )
+        
+        # parse out just the email address
+        _, sender_email = parseaddr(from_header)
+        return sender_email
+        
+    except HttpError as e:
+        if getattr(e, "status_code", None) == 404 or "Not Found" in str(e):
+            raise KeyError(id) from e
+        raise RuntimeError
+
+
 def fetch_unread_message_ids(service: Resource) -> Dict[str, Dict[str, str]]:
     """Retrieve unread message ids.
 
@@ -178,17 +226,26 @@ def fetch_message_by_id(
         # re-raise as KeyError on 404, as requested
         if getattr(e, "status_code", None) == 404 or "Not Found" in str(e):
             raise KeyError(id) from e
-        raise
+        raise RuntimeError
 
     payload = msg.get("payload") or {}
     headers_map = build_headers_dict(payload.get("headers") or [])
 
-    # pull canonical headers (may be missing → default to "")
+    # pull canonical headers (may be missing -> default to "")
     subject = headers_map.get("Subject", "")
-    from_ = headers_map.get("From", "")
-    to = headers_map.get("To", "")
-    cc = headers_map.get("Cc", [])  # cc must be an empty list
     date = headers_map.get("Date", "")
+
+    # pull out addresses
+    from_header = headers_map.get("From", "")
+    to_header = headers_map.get("To", "")
+    cc_header = headers_map.get("Cc", "")
+
+    from_ = parseaddr(from_header)[1] if from_header else []
+    to_addresses = getaddresses([to_header]) if to_header else []
+    cc_addresses = getaddresses([cc_header]) if cc_header else []
+
+    to_emails = [email for name, email in to_addresses]
+    cc_emails = [email for name, email in cc_addresses]
 
     # walk parts to get bodies and attachments
     found_bodies: Dict[str, Optional[str]] = {"text/plain": None, "text/html": None}
@@ -223,8 +280,8 @@ def fetch_message_by_id(
         internal_date_ms=int(msg.get("internalDate") or 0),
         subject=subject,
         from_=from_,
-        to=to,
-        cc=cc,
+        to=to_emails,
+        cc=cc_emails,
         date=date,
         headers=headers_map,
         text_body=found_bodies.get("text/plain"),
@@ -235,7 +292,7 @@ def fetch_message_by_id(
 
 
 def build_message_with_attachments(
-    recipient: str,
+    to: List[str],
     subject: str,
     body_text: str,
     *,
@@ -252,8 +309,8 @@ def build_message_with_attachments(
 
     Parameters
     ----------
-    recipient : str
-        Primary recipient email.
+    to : List[str]
+        Primary recipients of the email.
 
     subject : str
         Subject line (will be prefixed with "Re: " if replying and `ensure_re_prefix=True`).
@@ -303,7 +360,7 @@ def build_message_with_attachments(
 
     # build MIME
     msg = EmailMessage()
-    msg["To"] = recipient
+    msg["To"] = ", ".join(to)
     if cc:
         msg["Cc"] = ", ".join(cc)
     if reply_to:
@@ -391,7 +448,7 @@ def send_raw_message(
 
 def send_new_message(
     service: Resource,
-    recipient: str,
+    to: List[str],
     subject: str,
     body_text: str,
     *,
@@ -407,8 +464,8 @@ def send_new_message(
     service : Resource
         googleapiclient resource object.
 
-    recipient : str
-        Primary recipient email.
+    to : List[str]
+        Primary recipients email.
 
     subject : str
         Message subject.
@@ -445,7 +502,7 @@ def send_new_message(
     """
     # build raw message string
     raw = build_message_with_attachments(
-        recipient=recipient,
+        to=to,
         subject=subject,
         body_text=body_text,
         cc=cc,
@@ -501,35 +558,35 @@ def reply_to_existing_message(
         {"id": ..., "threadId": ...} of the sent message.
 
     """
-    hdrs = original.headers or {}
-
-    # Determine the primary "To" for the reply: Reply-To > From
-    primary_source = hdrs.get("Reply-To") or hdrs.get("From") or original.from_
-    to_list = list_emails_from_header(primary_source)
-    if not to_list:
-        err_msg = "Original message has no Reply-To/From address to reply to."
-        raise RuntimeError(err_msg)
-    to_addr = to_list[0]
-
     # build cc list for reply-all
     cc_addrs: List[str] = []
+    reply_to_addr = original.from_  # reply to the sender
+
     if reply_all:
-        others = set(
-            list_emails_from_header(hdrs.get("To"))
-            + list_emails_from_header(hdrs.get("Cc"))
-        )
-        # remove the primary reply target
-        others.discard(to_addr)
-        cc_addrs = sorted(others)
+        # parse all original recipients
+        from email.utils import getaddresses
+        
+        to_addresses = getaddresses([original.to]) if original.to else []
+        cc_addresses = getaddresses([original.cc]) if original.cc else []
+        
+        # extract just email addresses
+        to_emails = [email for _, email in to_addresses]
+        cc_emails = [email for _, email in cc_addresses]
+        
+        # combine all recipients except yourself and the original sender
+        all_recipients = set(to_emails + cc_emails)
+        all_recipients.discard(reply_to_addr)  # don't CC the person we're replying to
+        
+        cc_addrs = sorted(all_recipients)
 
     # threading headers for the reply
     subject = original.subject or ""
-    msg_id = hdrs.get("Message-Id") or hdrs.get("Message-ID")
-    refs = hdrs.get("References", "")
+    msg_id = original.headers.get("Message-Id") or original.headers.get("Message-ID")
+    refs = original.headers.get("References", "")
 
     # build raw message string
     raw = build_message_with_attachments(
-        recipient=to_addr,
+        to=[reply_to_addr],  # must be iterable
         subject=subject,
         body_text=body_text,
         cc=cc_addrs or None,
@@ -540,5 +597,5 @@ def reply_to_existing_message(
         ensure_re_prefix=True,
     )
 
-    # send into the same Gmail thread
+    # send the message
     return send_raw_message(service, raw, thread_id=original.thread_id)
