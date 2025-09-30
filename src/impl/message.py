@@ -1,14 +1,17 @@
 import base64
+import mimetypes
+from email.message import EmailMessage
+from email.utils import getaddresses
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 
 from googleapiclient.discovery import Resource
 from googleapiclient.errors import HttpError
 
-from typing import Dict, List, Optional, Union
-
 from src.schemas.message import GmailAttachment, GmailMessage
 
 
-def build_headers_dict(payload_headers: List[Dict]) -> Dict[str, str]:
+def build_headers_dict(payload_headers: List[Dict]) -> Dict[str, Any]:
     """Normalize headers into a case-insensitive dict (keys as canonical names)."""
     out: Dict[str, str] = {}
     for h in payload_headers or []:
@@ -18,6 +21,11 @@ def build_headers_dict(payload_headers: List[Dict]) -> Dict[str, str]:
             # preserve the last occurrence; Gmail may repeat some headers
             out[name] = value
     return out
+
+
+def list_emails_from_header(value: Optional[str]) -> List[str]:
+    """Parse a header field into a list of email address."""
+    return [addr for _, addr in getaddresses([value or ""]) if addr]
 
 
 def decode_b64url_to_text(b64: str) -> str:
@@ -92,7 +100,7 @@ def extract_message_content(
 
 def fetch_unread_message_ids(service: Resource) -> Dict[str, Dict[str, str]]:
     """Retrieve unread message ids.
-    
+
     Parameters
     ----------
     service : Resource
@@ -109,13 +117,18 @@ def fetch_unread_message_ids(service: Resource) -> Dict[str, Dict[str, str]]:
 
     while True:
         # users.messages.list returns dictionary with "messages" (List[Dict[str, str]]), "nextPageToken" (str), and "resultSizeEstimate" (int)
-        resp: Dict[str, Optional[Union[Dict[str, str], str, int]]] = service.users().messages().list(
-            userId="me",
-            labelIds=["INBOX"],
-            q="is:unread",
-            maxResults=500,
-            pageToken=page_token,
-        ).execute()
+        resp: Dict[str, Optional[Union[Dict[str, str], str, int]]] = (
+            service.users()
+            .messages()
+            .list(
+                userId="me",
+                labelIds=["INBOX"],
+                q="is:unread",
+                maxResults=500,
+                pageToken=page_token,
+            )
+            .execute()
+        )
 
         for m in resp.get("messages", []):
             unread_map[m["id"]] = {"threadId": m["threadId"]}
@@ -123,12 +136,14 @@ def fetch_unread_message_ids(service: Resource) -> Dict[str, Dict[str, str]]:
         page_token = resp.get("nextPageToken")
         if not page_token:
             break
-    
+
     # returns dict of dicts keyed by message id {"id": {"threadId": "abc123"}}
     return unread_map
 
 
-def fetch_message_by_id(service: Resource, id: str, download_attachments: bool = False) -> GmailMessage:
+def fetch_message_by_id(
+    service: Resource, id: str, download_attachments: bool = False
+) -> GmailMessage:
     """Query the service client for a message.
 
     Parameters
@@ -157,10 +172,7 @@ def fetch_message_by_id(service: Resource, id: str, download_attachments: bool =
     try:
         # query the service for a full message response
         msg: Dict[str, Optional[Union[Dict[str, str], str, int]]] = (
-            service.users()
-            .messages()
-            .get(userId="me", id=id, format="full")
-            .execute()
+            service.users().messages().get(userId="me", id=id, format="full").execute()
         )
     except HttpError as e:
         # re-raise as KeyError on 404, as requested
@@ -175,7 +187,7 @@ def fetch_message_by_id(service: Resource, id: str, download_attachments: bool =
     subject = headers_map.get("Subject", "")
     from_ = headers_map.get("From", "")
     to = headers_map.get("To", "")
-    cc = headers_map.get("Cc", "")
+    cc = headers_map.get("Cc", [])  # cc must be an empty list
     date = headers_map.get("Date", "")
 
     # walk parts to get bodies and attachments
@@ -220,3 +232,313 @@ def fetch_message_by_id(service: Resource, id: str, download_attachments: bool =
         snippet=msg.get("snippet", ""),
         attachments=attachments,
     )
+
+
+def build_message_with_attachments(
+    recipient: str,
+    subject: str,
+    body_text: str,
+    *,
+    cc: Optional[List[str]] = None,
+    attachment_paths: Optional[List[str]] = None,
+    body_html: Optional[str] = None,
+    reply_to: Optional[str] = None,
+    # --- reply-specific options ---
+    in_reply_to_message_id: Optional[str] = None,
+    references_chain: Optional[str] = None,
+    ensure_re_prefix: bool = True,
+) -> str:
+    """Build a base64url-encoded MIME email for Gmail API (new or reply).
+
+    Parameters
+    ----------
+    recipient : str
+        Primary recipient email.
+
+    subject : str
+        Subject line (will be prefixed with "Re: " if replying and `ensure_re_prefix=True`).
+
+    body_text : str
+        Plain text body.
+
+    cc : Optional[List[str]]
+        Additional recipients (comma-joined into Cc).
+
+    attachment_paths : Optional[List[str]]
+        Files to attach.
+
+    body_html : Optional[str]
+        Optional HTML alternative body (added via multipart/alternative).
+
+    reply_to : Optional[str]
+        "Reply-To" header value to include on the outgoing message.
+
+    in_reply_to_message_id : Optional[str]
+        The original message's "Message-Id" (or "Message-ID") header value. If set,
+        this builder adds `In-Reply-To` and extends `References`.
+
+    references_chain : Optional[str]
+        The original message's "References" header value (if any). If provided,
+        the builder appends `in_reply_to_message_id` if it isn't already present.
+
+    ensure_re_prefix : bool
+        If True and replying, prefix subject with "Re: " when missing.
+        Defaults to False.
+
+    Returns
+    -------
+    str
+        Base64url-encoded raw string suitable for Gmail API `users.messages.send`.
+
+    """
+    # subject handling (ensure "Re: " for replies if desired)
+    final_subject = subject
+    if (
+        in_reply_to_message_id
+        and ensure_re_prefix
+        and subject
+        and not subject.lower().startswith("re:")
+    ):
+        final_subject = f"Re: {subject}"
+
+    # build MIME
+    msg = EmailMessage()
+    msg["To"] = recipient
+    if cc:
+        msg["Cc"] = ", ".join(cc)
+    if reply_to:
+        msg["Reply-To"] = reply_to
+    msg["Subject"] = final_subject
+
+    # reply/threading headers
+    if in_reply_to_message_id:
+        msg["In-Reply-To"] = in_reply_to_message_id
+        if references_chain:
+            refs = references_chain
+            if in_reply_to_message_id not in refs:
+                refs = (refs + " " + in_reply_to_message_id).strip()
+            msg["References"] = refs
+        else:
+            msg["References"] = in_reply_to_message_id
+
+    # bodies
+    msg.set_content(body_text)
+    if body_html:
+        msg.add_alternative(body_html, subtype="html")
+
+    # attachments
+    for p in attachment_paths or []:
+        path = Path(p)
+        ctype, enc = mimetypes.guess_type(path)
+        if ctype is None or enc is not None:
+            ctype = "application/octet-stream"
+        maintype, subtype = ctype.split("/", 1)
+        with path.open("rb") as fh:
+            msg.add_attachment(
+                fh.read(),
+                maintype=maintype,
+                subtype=subtype,
+                filename=path.name,
+            )
+
+    # return base64url-encoded raw
+    return base64.urlsafe_b64encode(msg.as_bytes()).decode("utf-8")
+
+
+def send_raw_message(
+    service: Resource, raw: str, *, thread_id: Optional[str] = None
+) -> Dict[str, str]:
+    """Send a Gmail MIME message (base64url `raw`). Include `thread_id` to reply.
+
+    Parameters
+    ----------
+    raw : str
+        Base64 encoded message content.
+
+    thread_id : Optional[str]
+        Original thread identifier for replies.
+        Defaults to None.
+
+    Raises
+    ------
+    RuntimeError
+        On unsuccessful message send.
+
+    Returns
+    -------
+    Dict[str, str]
+        {"id": ..., "threadId": ...} of the sent message.
+
+    """
+    body = {"raw": raw}
+    if thread_id:
+        body["threadId"] = thread_id  # keep in same thread for replies
+
+    try:
+        resp = service.users().messages().send(userId="me", body=body).execute()
+    except HttpError as e:
+        raise RuntimeError(f"Gmail send failed: {e}") from e
+
+    msg_id = resp.get("id")
+    resp_thread_id = resp.get("threadId")
+    if not msg_id or not resp_thread_id:
+        raise RuntimeError(
+            f"Gmail send succeeded but response missing id/threadId: {resp!r}"
+        )
+
+    return {"id": msg_id, "threadId": resp_thread_id}
+
+
+def send_new_message(
+    service: Resource,
+    recipient: str,
+    subject: str,
+    body_text: str,
+    *,
+    cc: Optional[List[str]] = None,
+    attachment_paths: Optional[List[str]] = None,
+    body_html: Optional[str] = None,
+    reply_to: Optional[str] = None,
+) -> Dict[str, str]:
+    """Send a new email (non-reply).
+
+    Parameters
+    ----------
+    service : Resource
+        googleapiclient resource object.
+
+    recipient : str
+        Primary recipient email.
+
+    subject : str
+        Message subject.
+
+    body_text : str
+        Message body string content.
+
+    cc : Optional[List[str]]
+        Additional recipients.
+        Defaults to None.
+
+    attachment_paths : Optional[List[str]]
+        Paths to attached files.
+        Defaults to None.
+
+    body_html : Optional[str]
+        HTML content to replace body text.
+        Defaults to None.
+
+    reply_to : Optional[str]
+        Address to which replies should be directed.
+        Defaults to None.
+
+    Raises
+    ------
+    RuntimeError
+        On unsuccessful message send.
+
+    Returns
+    -------
+    Dict[str, str]
+        {"id": ..., "threadId": ...} of the sent message.
+
+    """
+    # build raw message string
+    raw = build_message_with_attachments(
+        recipient=recipient,
+        subject=subject,
+        body_text=body_text,
+        cc=cc,
+        attachment_paths=attachment_paths,
+        body_html=body_html,
+        reply_to=reply_to,
+    )
+
+    return send_raw_message(service, raw)
+
+
+def reply_to_existing_message(
+    service: Resource,
+    original: GmailMessage,
+    body_text: str,
+    *,
+    reply_all: bool = False,
+    body_html: Optional[str] = None,
+    attachment_paths: Optional[List[str]] = None,
+) -> Dict[str, str]:
+    """Reply (or reply-all) to an existing message represented by GmailMessage.
+
+    Returns None on success; raises RuntimeError on send failure.
+
+    Parameters
+    ----------
+    service : Resource
+        googleapiclient resource object.
+
+    original : GmailMessage
+        The original message object to reply to.
+
+    body_text : str
+        Plain-text body for the reply.
+
+    reply_all : bool
+        If True, include original To/Cc in Cc (excluding yourself and the primary reply target).
+
+    body_html : Optional[str]
+        Optional HTML alternative body.
+
+    attachment_paths : Optional[List[str]]
+        Optional file paths to attach.
+
+    Raises
+    ------
+    RuntimeError
+        On unsuccessful message send.
+
+    Returns
+    -------
+    Dict[str, str]
+        {"id": ..., "threadId": ...} of the sent message.
+
+    """
+    hdrs = original.headers or {}
+
+    # Determine the primary "To" for the reply: Reply-To > From
+    primary_source = hdrs.get("Reply-To") or hdrs.get("From") or original.from_
+    to_list = list_emails_from_header(primary_source)
+    if not to_list:
+        err_msg = "Original message has no Reply-To/From address to reply to."
+        raise RuntimeError(err_msg)
+    to_addr = to_list[0]
+
+    # build cc list for reply-all
+    cc_addrs: List[str] = []
+    if reply_all:
+        others = set(
+            list_emails_from_header(hdrs.get("To"))
+            + list_emails_from_header(hdrs.get("Cc"))
+        )
+        # remove the primary reply target
+        others.discard(to_addr)
+        cc_addrs = sorted(others)
+
+    # threading headers for the reply
+    subject = original.subject or ""
+    msg_id = hdrs.get("Message-Id") or hdrs.get("Message-ID")
+    refs = hdrs.get("References", "")
+
+    # build raw message string
+    raw = build_message_with_attachments(
+        recipient=to_addr,
+        subject=subject,
+        body_text=body_text,
+        cc=cc_addrs or None,
+        attachment_paths=list(attachment_paths) if attachment_paths else None,
+        body_html=body_html,
+        in_reply_to_message_id=msg_id,
+        references_chain=refs,
+        ensure_re_prefix=True,
+    )
+
+    # send into the same Gmail thread
+    return send_raw_message(service, raw, thread_id=original.thread_id)

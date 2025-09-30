@@ -26,7 +26,7 @@ class GmailMessage:
     subject: str
     from_: str
     to: str
-    cc: str
+    cc: List[str]
     date: str
     headers: Dict[str, str]
 
