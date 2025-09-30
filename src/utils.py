@@ -1,9 +1,10 @@
+import json
 import os.path
 
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
-from typing import List
+from typing import List, Set
 
 
 def retrieve_credentials(scopes: List[str]) -> Credentials:
@@ -41,21 +42,20 @@ def retrieve_credentials(scopes: List[str]) -> Credentials:
     return creds
 
 
-def validate_email_address(candidate: str, valid_addresses: List[str]) -> bool:
-    """Ensure an address is validated before interaction.
+def load_email_set(path: str) -> Set[str]:
+    # load list -> set; empty file defaults to empty set
+    def _norm(email: str) -> str:
+        # lowercase + trim; add more normalization if you need
+        return email.strip().lower()
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return { _norm(e) for e in data }
+    except FileNotFoundError:
+        return set()
 
-    Parameters
-    -----------
-    candidate : str
-        Address to check for.
 
-    valid_addresses : List[str]
-        List of valid addresses.
-    
-    Returns
-    -------
-    bool
-        Whether or not the address is approved for interaction.
-
-    """
-    return candidate in valid_addresses
+def validate_email_address(candidate: str, valid_set: Set) -> bool:
+    """Ensure an email address is part of the valid set."""
+    # O(1) lookup time
+    return candidate in valid_set
